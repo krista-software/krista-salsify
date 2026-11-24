@@ -1,0 +1,234 @@
+import java.util.regex.Pattern
+
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'jacoco'
+    id("io.github.surpsg.code-lines") version "0.0.1"
+    id("org.sonarqube") version "6.3.1.5724"
+}
+
+codeLinesStat {
+    sourceFilters.skipBlankLines = true
+    fileExtensions = ['java']
+}
+
+sonar {
+    properties {
+        property("sonar.projectName", "SonarScanner for Krista Salsify Extension (with JaCoCo code coverage)")
+        property("sonar.projectKey", "sonar-scanner-salsify-extension")
+        property("sonar.sources", "src/main/java")
+        property("sonar.tests", "src/test/java")
+        property("sonar.java.binaries", "build/classes/java/main")
+        property("sonar.java.test.binaries", "build/classes/java/test")
+        property("sonar.coverage.jacoco.xmlReportPaths", "build/reports/jacoco/test/jacocoTestReport.xml")
+        property("sonar.junit.reportPaths", "build/test-results/test")
+        property("sonar.coverage.exclusions", "**/connection/SalsifyHttpClient.java,**/SalsifyExtension.java,**/helpers/DynamicColumnSelector.java")
+    }
+}
+
+group 'com.krista.krista.extension.salsify'
+
+def computedVersion = "local"
+def computedBaseName = "Salsify"
+
+tasks.register("setReleaseProperties") {
+    dependsOn("generateReleaseProperties")
+    doFirst {
+        def releasePropsFile = file("release.properties")
+        if (releasePropsFile.exists()) {
+            def props = new Properties()
+            releasePropsFile.withInputStream { stream -> props.load(stream) }
+            computedBaseName = (props['extension.name'] ?: computedBaseName).replaceAll(/\s+/, "")
+            computedVersion = props['extension.version'] ?: computedVersion
+
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+
+            println "✓ Loaded extension name = ${computedBaseName}, version = ${computedVersion}"
+        } else {
+            logger.warn("⚠ release.properties not found; using default values.")
+            project.ext.set("finalBaseName", computedBaseName)
+            project.version = computedVersion
+        }
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenLocal()
+    maven {
+        url "https://packages.cicd.in.antbrains.com/artifactory/libs-release"
+    }
+    mavenCentral()
+}
+
+dependencies {
+    annotationProcessor 'app.krista:extension-impl-anno-processors:1.0.121'
+    implementation('app.krista:krista-apis:1.0.121') {
+        exclude group: 'org.apache.logging.log4j', module: 'log4j-slf4j-impl'
+        exclude group: 'org.apache.logging.log4j', module: 'log4j-core'
+    }
+    implementation 'com.squareup.okhttp3:okhttp:5.3.2'
+
+    // Testing
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.9.2'
+    testImplementation 'org.junit.jupiter:junit-jupiter-engine:5.9.2'
+    testImplementation 'org.mockito:mockito-core:5.3.1'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.3.1'
+    testImplementation 'com.squareup.okhttp3:mockwebserver:5.3.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.register('createSourceDir', Exec) {
+    dependsOn processResources
+    commandLine "mkdir", "-p", "$projectDir/build/classes/java/main/META-INF/project"
+}
+
+tasks.register('copyGradleFile', Exec) {
+    dependsOn createSourceDir
+    commandLine "cp", "$projectDir/build.gradle", "$projectDir/build/classes/java/main/META-INF/project/build.gradle"
+}
+
+tasks.register('includeSources', Exec) {
+    dependsOn copyGradleFile
+    commandLine "cp", "-r", "$projectDir/src", "$projectDir/build/classes/java/main/META-INF/project/src"
+}
+
+tasks.register('generateReleaseProperties') {
+    group = 'build'
+    description = 'Generates release.properties file with extension version and domain information'
+
+    doLast {
+        def extensionFilePath = 'src/main/java/com/krista/krista/extension/salsify/SalsifyExtension.java'
+        def areaFilePath = 'src/main/java/com/krista/krista/extension/salsify/catalog/SalsifyProductArea.java'
+        def extensionFile = project.file(extensionFilePath)
+        def areaFile = project.file(areaFilePath)
+
+        if (!extensionFile.exists()) {
+            throw new GradleException("Extension file not found: ${extensionFilePath}")
+        }
+        if (!areaFile.exists()) {
+            throw new GradleException("Area file not found: ${areaFilePath}")
+        }
+
+        def properties = new Properties()
+        def keyValuePattern = Pattern.compile(/(\w+)\s*=\s*"([^"]+)"/)
+
+        extractAnnotationInfo(extensionFile, "@Extension", keyValuePattern) { key, value ->
+            if (key == "version") {
+                properties.setProperty("extension.version", value)
+                logger.lifecycle("Found extension version: ${value}")
+            } else if (key == "name") {
+                properties.setProperty("extension.name", value)
+                logger.lifecycle("Found extension name: ${value}")
+            }
+        }
+
+        extractAnnotationInfo(areaFile, "@Domain", keyValuePattern) { key, value ->
+            if (key == "name") {
+                properties.setProperty("domain.name", value)
+                logger.lifecycle("Found domain name: ${value}")
+            } else if (key == "ecosystemName") {
+                properties.setProperty("ecosystem.name", value)
+                logger.lifecycle("Found ecosystem name: ${value}")
+            }
+        }
+
+        if (!properties.getProperty('extension.name')) {
+            properties.setProperty("extension.name", "SalsifyExtension")
+        }
+        if (!properties.getProperty('extension.version')) {
+            throw new GradleException("Could not find extension version in ${extensionFilePath}")
+        }
+        if (!properties.getProperty('domain.name')) {
+            properties.setProperty("domain.name", "SalsifyProducts")
+        }
+        if (!properties.getProperty('ecosystem.name')) {
+            properties.setProperty("ecosystem.name", "Product Information Management")
+        }
+
+        def releasePropertiesFile = project.file('release.properties')
+        def content = properties.collect { key, value -> "${key}=${value}" }.join('\n')
+        releasePropertiesFile.text = content + '\n'
+        logger.lifecycle("Generated release.properties with content:\n${content}")
+    }
+}
+
+def extractAnnotationInfo(File file, String annotationName, Pattern keyValuePattern, Closure processProperty) {
+    StringBuilder annotationText = new StringBuilder()
+    boolean inAnnotation = false
+    file.eachLine { line ->
+        line = line.trim()
+        if (line.contains(annotationName)) {
+            inAnnotation = true
+            annotationText.setLength(0)
+            annotationText.append(line)
+        } else if (inAnnotation) {
+            annotationText.append(line)
+        }
+        if (inAnnotation && line.contains(")")) {
+            inAnnotation = false
+            def matcher = keyValuePattern.matcher(annotationText.toString())
+            while (matcher.find()) {
+                def key = matcher.group(1)
+                def value = matcher.group(2)
+                processProperty.call(key, value)
+            }
+        }
+    }
+}
+
+task copyDocsToDocs(type: Copy) {
+    description = 'Copy docs directory to static/docs for custom_tabs'
+    from 'src/main/resources/docs'
+    into 'build/resources/main/static/docs'
+    exclude 'index.html'  // Keep the docsify index.html in static/docs, not from source
+}
+
+tasks.named("processResources") {
+    dependsOn copyDocsToDocs
+}
+
+tasks.named("jar") {
+    dependsOn tasks.named("generateReleaseProperties")
+}
+
+jar {
+    dependsOn tasks.named("setReleaseProperties")
+    dependsOn includeSources
+
+    archiveBaseName = project.ext.has("finalBaseName") ? project.ext.finalBaseName : "SalsifyExtension"
+
+    manifest {}
+    from {
+        configurations.runtimeClasspath.collect {
+            it.isDirectory() ? it : zipTree(it)
+        }
+    }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF', 'META-INF/*.DSA'
+    duplicatesStrategy = "exclude"
+}
+
+test {
+    useJUnitPlatform()
+    ignoreFailures = true
+    finalizedBy jacocoTestReport
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = true
+        csv.required = false
+    }
+}
+
+tasks.named('sonar') {
+    dependsOn jacocoTestReport
+}
